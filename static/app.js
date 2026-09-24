@@ -20,6 +20,14 @@ const state = {
   coverage: null,             // branch coverage stats for the saved script, null = unknown
 };
 
+// Specified-option route planning state (pure, never persisted).
+const planState = {
+  selected: new Set(),        // "nodeId::optionId" checkboxes currently ticked
+  result: null,               // last planning response
+  highlight: { nodes: new Set(), edges: new Set() },  // "nodeId::optionId"
+  keepHighlightOnClose: false,
+};
+
 const HISTORY_LIMIT = 100;
 const MERGE_WINDOW_MS = 700;  // consecutive typing in the same field merges into one entry
 
@@ -310,6 +318,7 @@ function renderNodeFlags() {
       const p = document.getElementById(`port-${n.id}-${o.id}`);
       if (p) p.classList.toggle("dangle", !o.target_id);
     });
+    el.classList.toggle("plan-hl-node", planState.highlight.nodes.has(n.id));
   });
 }
 
@@ -369,12 +378,13 @@ function drawEdges() {
       const mx = (from.x + to.x) / 2;
       const d = `M ${from.x} ${from.y} C ${mx} ${from.y}, ${mx} ${to.y}, ${to.x} ${to.y}`;
       const inCycle = state.markers.cycles.includes(n.id) && state.markers.cycles.includes(o.target_id);
+      const inPlan = planState.highlight.edges.has(`${n.id}::${o.id}`) && !!o.target_id;
       const sel = state.selectedEdge &&
         state.selectedEdge.nodeId === n.id && state.selectedEdge.optionId === o.id;
       const path = document.createElementNS(NS, "path");
       path.setAttribute("d", d);
       path.setAttribute("class",
-        `edge ${dangling ? "dangle" : ""} ${inCycle ? "cycle" : ""} ${sel ? "selected" : ""}`);
+        `edge ${dangling ? "dangle" : ""} ${inCycle ? "cycle" : ""} ${sel ? "selected" : ""} ${inPlan ? "plan-hl-edge" : ""}`);
       path.setAttribute("pointer-events", "stroke");
       path.dataset.node = n.id;
       path.dataset.opt = o.id;
@@ -392,7 +402,7 @@ function drawEdges() {
       ].map((p) => p.join(",")).join(" ");
       const tri = document.createElementNS(NS, "polygon");
       tri.setAttribute("points", pts);
-      tri.setAttribute("class", `arrow ${dangling ? "dangle" : ""} ${inCycle ? "cycle" : ""} ${sel ? "selected" : ""}`);
+      tri.setAttribute("class", `arrow ${dangling ? "dangle" : ""} ${inCycle ? "cycle" : ""} ${sel ? "selected" : ""} ${inPlan ? "plan-hl-edge" : ""}`);
       svg.appendChild(tri);
     });
   });
@@ -602,6 +612,9 @@ function applyHistory(step) {
   }
   state.connecting = null;
   state.dragNode = null;
+  planState.selected.clear();
+  planState.result = null;
+  clearPlanHighlight();
   syncDirty();
   validateLocal();
   renderAll();
@@ -615,6 +628,9 @@ const redo = () => applyHistory(1);
 
 let validateTimer;
 function changed() {
+  // canvas edits invalidate any previously highlighted route
+  if (planState.result) clearPlanHighlight();
+  planState.result = null;
   pushHistory();
   drawNodes();
   drawEdges();
@@ -642,6 +658,9 @@ async function loadList(selectId) {
     state.doc = null;
     state.dirty = false;
     state.coverage = null;
+    planState.selected.clear();
+    planState.result = null;
+    clearPlanHighlight();
     state.markers = { cycles: [], orphans: [], uncovered: [], errors: [] };
     resetHistory();
     renderStatus();
@@ -655,6 +674,10 @@ async function openScript(id) {
   state.selectedNodeId = null;
   state.selectedEdge = null;
   state.dirty = false;
+  planState.selected.clear();
+  planState.result = null;
+  planState.keepHighlightOnClose = false;
+  clearPlanHighlight();
   $("#scriptName").value = s.name;
   state.pan = { x: 60, y: 40 };
   await loadCoverage();
@@ -715,6 +738,12 @@ function bindToolbar() {
   $("#btnSave").onclick = saveScript;
   $("#btnPreview").onclick = openPreview;
   $("#btnCoverage").onclick = openCoverage;
+  $("#btnRoute").onclick = openRoutePlan;
+  $("#routePlanBtn").onclick = runRoutePlan;
+  $("#routeClear").onclick = () => {
+    planState.selected.clear();
+    renderRouteOptions();
+  };
   $("#btnShare").onclick = openShare;
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();
@@ -1004,6 +1033,218 @@ async function confirmPort() {
     portSubgraphSummary(order).internal} 条内部连接`);
 }
 
+// ---------------------------------------------------------------- specified-option route planning
+// Pure, stateless: the current canvas content is POSTed to /api/plan/route.
+// Nothing is saved, no run is created and coverage stats are unaffected.
+
+const PLAN_MAX = 6;
+
+// Options that can be ticked: belong to a non-terminal node and are connected
+// to an existing target node (only they can ever be chosen).
+function plannableOptions() {
+  const content = state.doc.content;
+  const map = new Map(content.nodes.map((n) => [n.id, n]));
+  const groups = [];
+  content.nodes.forEach((n) => {
+    if (n.terminal) return;
+    const opts = (n.options || []).filter((o) => o.target_id && map.has(o.target_id));
+    if (opts.length) groups.push({ node: n, options: opts });
+  });
+  return groups;
+}
+
+function openRoutePlan() {
+  if (!state.doc) return;
+  planState.result = null;
+  // Drop selections that no longer match the canvas (edited away / disconnected).
+  const valid = new Set();
+  plannableOptions().forEach((g) => g.options.forEach((o) => valid.add(`${g.node.id}::${o.id}`)));
+  planState.selected = new Set([...planState.selected].filter((k) => valid.has(k)));
+  renderRouteOptions();
+  $("#routeResult").innerHTML = "";
+  openModal("routeModal");
+}
+
+function renderRouteOptions() {
+  const box = $("#routeOptions");
+  const content = state.doc.content;
+  if (!content.nodes.some((n) => n.id === content.start_node_id)) {
+    box.innerHTML = `<div class="route-empty">⚠ 当前画布没有有效的起始节点，请先在右侧「脚本设置」中选择起始节点，再进行路线规划。</div>`;
+    updateRouteCount();
+    return;
+  }
+  const groups = plannableOptions();
+  if (!groups.length) {
+    box.innerHTML = `<div class="route-empty">当前画布没有可勾选的选项——只有<b>已连接到目标节点、且来源节点未标记为终止</b>的选项才能纳入规划。</div>`;
+    updateRouteCount();
+    return;
+  }
+  box.innerHTML = groups.map((g) => {
+    const isStart = g.node.id === content.start_node_id;
+    return `<div class="route-group">
+      <div class="route-group-head">
+        <span class="route-group-title">${esc(g.node.title || "(未命名节点)")}</span>
+        <span class="route-group-id">${esc(g.node.id)}${isStart ? " · 起始" : ""}</span>
+      </div>
+      ${g.options.map((o) => {
+        const key = `${g.node.id}::${o.id}`;
+        const target = getNode(o.target_id);
+        return `<label class="route-opt" data-key="${esc(key)}">
+          <input type="checkbox" value="${esc(key)}" ${planState.selected.has(key) ? "checked" : ""}>
+          <span class="route-opt-label">${esc(o.label || "(未命名选项)")}</span>
+          <span class="route-opt-arrow">→</span>
+          <span class="route-opt-target">${esc(target ? (target.title || target.id) : "")}</span>
+        </label>`;
+      }).join("")}
+    </div>`;
+  }).join("");
+  box.querySelectorAll(".route-opt input").forEach((cb) => {
+    cb.onchange = () => {
+      const key = cb.value;
+      if (cb.checked) {
+        if (planState.selected.size >= PLAN_MAX) {
+          cb.checked = false;
+          toast(`最多勾选 ${PLAN_MAX} 个选项`);
+          return;
+        }
+        planState.selected.add(key);
+      } else planState.selected.delete(key);
+      updateRouteCount();
+    };
+  });
+  updateRouteCount();
+}
+
+function updateRouteCount() {
+  const el = $("#routeCount");
+  const n = planState.selected.size;
+  const btn = $("#routePlanBtn");
+  el.innerHTML = `已勾选 <b>${n}</b>/${PLAN_MAX} 个选项` +
+    (n === 0 ? `（勾选 1～${PLAN_MAX} 个后可规划）` : "");
+  el.classList.toggle("ready", n > 0);
+  if (btn) btn.disabled = n === 0;
+}
+
+async function runRoutePlan() {
+  const content = state.doc.content;
+  const required = [...planState.selected].map((k) => {
+    const [node_id, option_id] = k.split("::");
+    return { node_id, option_id };
+  });
+  if (!required.length) return;
+  const btn = $("#routePlanBtn");
+  btn.disabled = true; btn.textContent = "规划中…";
+  try {
+    planState.result = await api("/api/plan/route", {
+      method: "POST", body: { content, required },
+    });
+    renderRouteResult(planState.result);
+  } catch (err) {
+    $("#routeResult").innerHTML = `<div class="route-fail">⚠ ${esc(err.message)}</div>`;
+  } finally {
+    btn.textContent = "开始规划";
+    updateRouteCount();
+  }
+}
+
+function nodeChipHtml(node, extra = "") {
+  const kind = node.type === "info" ? "告知" : "问题";
+  return `<span class="route-node-chip ${extra}" data-locate="${esc(node.id)}"
+      title="点击定位到画布中的该节点">${esc(node.title || "(未命名节点)")}
+      <small>${esc(kind)}${node.terminal ? " · 终止" : ""} · ${esc(node.id)}</small></span>`;
+}
+
+function renderRouteResult(r) {
+  const el = $("#routeResult");
+  if (!r.feasible) {
+    clearPlanHighlight();
+    let extra = "";
+    if (r.unreachable_required?.length) {
+      extra = `<div class="route-unreachable">从起始节点无法到达以下勾选选项所在的节点：` +
+        r.unreachable_required.map((u) =>
+          `<span class="route-chip-miss">「${esc(u.label || u.option_id)}」（节点 ${esc(u.node_title || u.node_id)}）</span>`).join("、") +
+        `</div>`;
+    }
+    el.innerHTML = `<div class="route-fail">
+        <div class="route-fail-title">无解</div>
+        <div>${esc(r.reason || "不存在满足条件的可行路线。")}</div>
+        ${extra}
+      </div>`;
+    return;
+  }
+  applyPlanHighlight(r);
+  const choiceSteps = r.steps.filter((s) => s.choice);
+  el.innerHTML = `
+    <div class="route-ok">
+      ✓ 找到最短选择序列：共 <b>${r.choice_count}</b> 次选择、经过 <b>${r.node_count}</b> 个节点
+      （覆盖全部 ${r.required_count} 个勾选选项；点击任一节点可定位到画布）
+    </div>
+    <div class="route-timeline">
+      ${r.steps.map((s, i) => {
+        if (!s.choice) {
+          return `<div class="route-step route-end-row">
+              <span class="route-step-no">${s.seq}</span>
+              ${nodeChipHtml(s.node, "end")}
+              <span class="route-end-badge">${s.node.terminal ? "终止节点 · 结束" : "无选项节点 · 结束"}</span>
+            </div>`;
+        }
+        return `<div class="route-step">
+            <span class="route-step-no">${s.seq}</span>
+            ${nodeChipHtml(s.node)}
+            <span class="route-choice ${s.choice.required ? "required" : ""}">
+              ${s.choice.required ? '<span class="req-star" title="勾选的必选选项">★</span>' : ""}
+              ${esc(s.choice.label || "(未命名选项)")}
+            </span>
+            <span class="route-big-arrow">→</span>
+            ${nodeChipHtml(s.target, i === choiceSteps.length - 1 ? "end" : "")}
+          </div>`;
+      }).join("")}
+    </div>`;
+  el.querySelectorAll("[data-locate]").forEach((chip) => {
+    chip.onclick = () => {
+      // closing the modal normally drops the highlight; keep it for a chip jump
+      planState.keepHighlightOnClose = true;
+      closeModal("routeModal");
+      locateNode(chip.dataset.locate);
+    };
+  });
+}
+
+function applyPlanHighlight(r) {
+  const nodes = new Set();
+  const edges = new Set();
+  r.steps.forEach((s) => {
+    if (s.node) nodes.add(s.node.id);
+    if (s.choice) edges.add(`${s.node.id}::${s.choice.option_id}`);
+  });
+  planState.highlight = { nodes, edges };
+  drawNodes();
+  drawEdges();
+}
+
+function clearPlanHighlight() {
+  planState.highlight = { nodes: new Set(), edges: new Set() };
+  if (state.doc) { drawNodes(); drawEdges(); }
+}
+
+// Select a node, pan the canvas so it sits near the center, and flash it.
+function locateNode(nodeId) {
+  if (!getNode(nodeId)) return;
+  state.selectedNodeId = nodeId;
+  state.selectedEdge = null;
+  const n = getNode(nodeId);
+  const rect = $("#canvasWrap").getBoundingClientRect();
+  state.pan = { x: rect.width / 2 - (n.x + 115), y: rect.height / 2 - (n.y + 70) };
+  renderCanvas();
+  renderInspector();
+  const el = document.getElementById(`node-${nodeId}`);
+  if (el) {
+    el.classList.remove("locate-flash");
+    void el.offsetWidth;          // restart the CSS animation
+    el.classList.add("locate-flash");
+  }
+}
+
 // ---------------------------------------------------------------- share / preview
 
 async function openShare() {
@@ -1081,6 +1322,20 @@ function bindCoverageAutoRefresh() {
     await loadCoverage();
     renderInspector();
   }).observe(document.getElementById("previewModal"), { attributes: true, attributeFilter: ["class"] });
+}
+
+// Closing the route-planning modal removes the route highlight from the canvas;
+// clicking a result chip also closes the modal but (re)applies the highlight
+// first so it stays visible behind the locating flash.
+function bindRouteModalClose() {
+  new MutationObserver(() => {
+    if (document.getElementById("routeModal").classList.contains("open")) return;
+    if (planState.keepHighlightOnClose) {
+      planState.keepHighlightOnClose = false;
+      return;
+    }
+    clearPlanHighlight();
+  }).observe(document.getElementById("routeModal"), { attributes: true, attributeFilter: ["class"] });
 }
 
 // ---------------------------------------------------------------- canvas interaction
@@ -1206,6 +1461,7 @@ function bindCanvas() {
   bindToolbar();
   bindCanvas();
   bindCoverageAutoRefresh();
+  bindRouteModalClose();
   await loadList();
   if (!state.scripts.length) await newScript(true);
 })();

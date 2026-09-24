@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import get_db, init_db
+from .graph import plan_route
 from .graph import step as graph_step
 from .graph import validate as validate_content
 
@@ -59,6 +60,19 @@ class ScriptUpdate(BaseModel):
 class RunStart(BaseModel):
     script_id: int | None = None
     share_token: str | None = None
+
+
+class RouteRequiredOption(BaseModel):
+    node_id: str
+    option_id: str
+
+
+class RoutePlanIn(BaseModel):
+    # The current canvas is sent directly: planning is a pure, stateless
+    # computation. It never saves the script, never creates a run record and
+    # never touches branch-coverage statistics.
+    content: ContentIn
+    required: list[RouteRequiredOption] = Field(min_length=1, max_length=6)
 
 
 class RunChoice(BaseModel):
@@ -138,6 +152,25 @@ def delete_script(script_id: int):
 def validate_saved_script(script_id: int):
     script = _fetch_script(script_id)
     result = validate_content(script["content"])
+    return result
+
+
+# ---- specified-option route planning --------------------------------------
+
+@app.post("/api/plan/route")
+def plan_specified_route(payload: RoutePlanIn):
+    """Shortest choice sequence covering 1..6 required options.
+
+    Pure stateless query over the canvas content supplied in the request:
+    nothing is persisted — the script is not saved, no run is created and
+    branch-coverage counts are untouched. Returns feasible=false (never a
+    partial path) when no such sequence exists.
+    """
+    try:
+        result = plan_route(payload.content.model_dump(),
+                            [o.model_dump() for o in payload.required])
+    except ValueError as exc:
+        raise HTTPException(400, str(exc))
     return result
 
 
