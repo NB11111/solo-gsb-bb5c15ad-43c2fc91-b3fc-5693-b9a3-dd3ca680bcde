@@ -1,4 +1,4 @@
-"""Branch script graph: validation (cycles / orphans / uncovered exits) and traversal."""
+"""Branch script graph: validation, traversal and waypoint route planning."""
 from __future__ import annotations
 
 from collections import deque
@@ -122,6 +122,95 @@ def _find_cycle_nodes(node_ids: list, adjacency: dict[Any, list]) -> list:
         if nid not in indices:
             strongconnect(nid)
     return list(cycle_nodes)
+
+
+# ---- route planning -------------------------------------------------------
+
+def plan_route(content: dict[str, Any], waypoints: list[dict]) -> dict[str, Any]:
+    """Shortest choice sequence through every waypoint option at least once.
+
+    Starts at ``start_node_id``; each step chooses one connected option and
+    counts 1. A route is complete when every waypoint option has been chosen
+    at least once AND the current node is terminal — either flagged
+    ``terminal`` or simply having no options. Terminal-flagged nodes allow no
+    further choices. Cycles and repeated visits are permitted: the search is
+    a BFS over ``(node_id, collected-waypoints bitmask)`` states, so the first
+    complete route found is shortest by choice count. When no route exists the
+    result is ``solvable: False`` with a reason — never a partial path.
+    """
+    nodes: list[dict] = content.get("nodes") or []
+    node_map = {n.get("id"): n for n in nodes}
+    start_id = content.get("start_node_id")
+    unsolvable = {"solvable": False, "choice_count": 0, "steps": []}
+    if start_id not in node_map:
+        return {**unsolvable, "reason": "起始节点未设置或不存在"}
+
+    wp_index = {(w["node_id"], w["option_id"]): i for i, w in enumerate(waypoints)}
+    full = (1 << len(waypoints)) - 1
+
+    def is_end(node: dict) -> bool:
+        return bool(node.get("terminal")) or not (node.get("options") or [])
+
+    start_state = (start_id, 0)
+    parent: dict[tuple, Any] = {start_state: None}  # state -> (prev_state, choice)
+    queue = deque([start_state])
+    goal = None
+    while queue:
+        cur_id, mask = queue.popleft()
+        node = node_map[cur_id]
+        if mask == full and is_end(node):
+            goal = (cur_id, mask)
+            break
+        if node.get("terminal"):
+            continue  # terminal nodes cannot continue
+        for opt in node.get("options", []) or []:
+            target = opt.get("target_id")
+            if not target or target not in node_map:
+                continue  # unconnected options are not selectable
+            bit = wp_index.get((cur_id, opt.get("id")))
+            nxt = (target, mask | (1 << bit) if bit is not None else mask)
+            if nxt not in parent:
+                parent[nxt] = ((cur_id, mask), (cur_id, opt.get("id"), target))
+                queue.append(nxt)
+
+    if goal is None:
+        return {**unsolvable,
+                "reason": "从起始节点出发，不存在经过全部勾选选项并到达终止节点（含无选项节点）的路线"}
+
+    choices = []
+    state = goal
+    while parent[state] is not None:
+        prev, choice = parent[state]
+        choices.append(choice)
+        state = prev
+    choices.reverse()
+
+    steps = []
+    for node_id, option_id, target_id in choices:
+        node = node_map[node_id]
+        opt = next((o for o in node.get("options", []) if o.get("id") == option_id), {})
+        target = node_map[target_id]
+        steps.append({
+            "node_id": node_id,
+            "title": node.get("title", ""),
+            "option_id": option_id,
+            "option_label": opt.get("label", ""),
+            "target_id": target_id,
+            "target_title": target.get("title", ""),
+            "waypoint": (node_id, option_id) in wp_index,
+        })
+    end_node = node_map[goal[0]]
+    return {
+        "solvable": True,
+        "reason": None,
+        "choice_count": len(steps),
+        "steps": steps,
+        "start_node_id": start_id,
+        "start_title": node_map[start_id].get("title", ""),
+        "end_node_id": goal[0],
+        "end_title": end_node.get("title", ""),
+        "end_terminal": bool(end_node.get("terminal")),
+    }
 
 
 # ---- runtime traversal ----------------------------------------------------

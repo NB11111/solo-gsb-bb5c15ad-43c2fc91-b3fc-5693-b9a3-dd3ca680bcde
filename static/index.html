@@ -30,6 +30,7 @@
       <div class="spacer"></div>
       <button id="btnPreview">▶ 运行预览</button>
       <button id="btnCoverage" title="按已保存运行记录统计各选项被选择次数">📊 分支覆盖</button>
+      <button id="btnRoute" title="勾选 1～6 个已连接选项，规划经过它们到达终点的最短选择序列">🧭 路线规划</button>
       <button id="btnShare">🔗 只读分享</button>
       <button id="btnExport">导出 JSON</button>
       <button id="btnImport">导入 JSON</button>
@@ -94,6 +95,30 @@
     <footer>
       <button id="coverageRefresh">↻ 刷新统计</button>
       <button data-close="coverageModal">关闭</button>
+    </footer>
+  </div>
+</div>
+
+<!-- route plan modal -->
+<div class="modal-mask" id="routeModal">
+  <div class="modal wide">
+    <header>指定选项路线规划<span class="close" data-close="routeModal">✕</span></header>
+    <div class="body">
+      <p class="route-tip">
+        勾选 <b>1～6</b> 个已连接目标的选项，求从<b>起始节点</b>出发、经过每个勾选选项至少一次、
+        最终到达<b>终止节点（含无选项节点）</b>的最短选择序列（以选择次数计）。
+        搜索允许环路和重复访问节点，但标记为终止的节点不可继续选择；无可行路线时明确显示无解，不返回部分路径。<br>
+        规划基于<b>当前画布</b>（含未保存修改）只读计算：不会保存脚本，也不生成运行记录或改变分支覆盖统计。
+      </p>
+      <div class="route-pick" id="routePick"></div>
+      <div class="route-actions">
+        <span class="route-count" id="routePickCount">已选 0/6</span>
+        <button class="primary" id="routeRun" disabled>🧭 开始规划</button>
+      </div>
+      <div id="routeResult"></div>
+    </div>
+    <footer>
+      <button data-close="routeModal">关闭</button>
     </footer>
   </div>
 </div>

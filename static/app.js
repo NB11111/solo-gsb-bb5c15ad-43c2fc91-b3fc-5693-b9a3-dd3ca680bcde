@@ -255,6 +255,170 @@ function renderCoverageModal(c) {
   });
 }
 
+// ---------------------------------------------------------------- route planning
+// 指定选项路线规划: check 1–6 options that have connected targets on the
+// CURRENT canvas (unsaved edits included); the server BFSes over
+// (node, collected-options bitmask) states for the shortest choice sequence
+// from the start node that traverses every checked option at least once and
+// ends at a terminal node (terminal flag or no options). Planning is
+// read-only: it never saves the script, never creates run records and never
+// changes branch coverage statistics.
+
+const ROUTE_MAX_PICKS = 6;
+const routeState = {
+  picked: new Map(),      // "nodeId::optionId" -> {node_id, option_id}
+  lastResult: null,       // last /api/route-plan response
+  resultSnap: null,       // JSON of the canvas content that response came from
+};
+
+const routeKey = (nodeId, optionId) => `${nodeId}::${optionId}`;
+
+// Pickable options: connected to an existing target node, grouped by node.
+function routeEligible() {
+  const nodes = state.doc?.content.nodes || [];
+  const ids = new Set(nodes.map((n) => n.id));
+  return nodes
+    .map((n) => ({ node: n, options: (n.options || []).filter((o) => o.target_id && ids.has(o.target_id)) }))
+    .filter((g) => g.options.length);
+}
+
+function pruneRoutePicks() {
+  const valid = new Set();
+  routeEligible().forEach((g) => g.options.forEach((o) => valid.add(routeKey(g.node.id, o.id))));
+  [...routeState.picked.keys()].forEach((k) => { if (!valid.has(k)) routeState.picked.delete(k); });
+}
+
+function openRoute() {
+  if (!state.doc) return;
+  pruneRoutePicks();
+  // canvas edited since the last plan: the old result no longer applies
+  if (routeState.resultSnap !== JSON.stringify(state.doc.content)) routeState.lastResult = null;
+  renderRoutePicker();
+  renderRouteResult();
+  openModal("routeModal");
+}
+
+function updateRouteFooter() {
+  const n = routeState.picked.size;
+  $("#routePickCount").textContent = `已选 ${n}/${ROUTE_MAX_PICKS}`;
+  $("#routeRun").disabled = n < 1;
+}
+
+function renderRoutePicker() {
+  const box = $("#routePick");
+  const groups = routeEligible();
+  if (!groups.length) {
+    box.innerHTML = `<div class="route-empty">当前画布没有已连接目标的选项可勾选，请先拖拽选项圆点连线。</div>`;
+  } else {
+    box.innerHTML = groups.map((g) => `
+      <div class="route-group">
+        <div class="route-group-head">${esc(g.node.title || "(未命名节点)")}
+          ${g.node.id === state.doc.content.start_node_id ? '<span class="route-tag">起始</span>' : ""}
+          ${g.node.terminal ? '<span class="route-tag end">终点</span>' : ""}
+        </div>
+        ${g.options.map((o) => {
+          const tgt = getNode(o.target_id);
+          const key = routeKey(g.node.id, o.id);
+          return `<label class="route-opt">
+            <input type="checkbox" data-rnode="${esc(g.node.id)}" data-ropt="${esc(o.id)}"
+                   ${routeState.picked.has(key) ? "checked" : ""}>
+            <span class="route-opt-label">${esc(o.label || "(未命名选项)")}</span>
+            <span class="route-opt-target">→ ${esc(tgt?.title || o.target_id)}</span>
+          </label>`;
+        }).join("")}
+      </div>`).join("");
+    box.querySelectorAll("input[data-rnode]").forEach((cb) => {
+      cb.onchange = () => {
+        const key = routeKey(cb.dataset.rnode, cb.dataset.ropt);
+        if (cb.checked) {
+          if (routeState.picked.size >= ROUTE_MAX_PICKS) {
+            cb.checked = false;
+            toast(`最多勾选 ${ROUTE_MAX_PICKS} 个选项`);
+            return;
+          }
+          routeState.picked.set(key, { node_id: cb.dataset.rnode, option_id: cb.dataset.ropt });
+        } else {
+          routeState.picked.delete(key);
+        }
+        routeState.lastResult = null;   // picks changed: previous result is stale
+        updateRouteFooter();
+        renderRouteResult();
+      };
+    });
+  }
+  updateRouteFooter();
+}
+
+async function runRoutePlan() {
+  if (!state.doc) return;
+  const options = [...routeState.picked.values()];
+  if (!options.length) { toast("请先勾选 1～6 个已连接目标的选项"); return; }
+  $("#routeRun").disabled = true;
+  try {
+    const r = await api("/api/route-plan", {
+      method: "POST",
+      body: { content: state.doc.content, options },
+    });
+    routeState.lastResult = r;
+    routeState.resultSnap = JSON.stringify(state.doc.content);
+  } catch (err) {
+    toast("路线规划失败：" + err.message, 3500);
+  }
+  renderRouteResult();
+  updateRouteFooter();
+}
+
+function renderRouteResult() {
+  const el = $("#routeResult");
+  const r = routeState.lastResult;
+  if (!el) return;
+  if (!r) { el.innerHTML = ""; return; }
+  if (!r.solvable) {
+    el.innerHTML = `<div class="route-none">✕ 无解：${esc(r.reason || "不存在满足条件的路线")}，不返回部分路径。</div>`;
+    return;
+  }
+  const nodeBtn = (id, title) =>
+    `<button class="route-node" data-rnode="${esc(id)}" title="定位到画布">${esc(title || id)}</button>`;
+  el.innerHTML = `
+    <div class="route-ok">
+      <div class="route-summary">✓ 最短路线：共 <b>${r.choice_count}</b> 次选择（点击节点名可定位到画布）</div>
+      <div class="route-step route-start">
+        <span class="route-idx">起</span>${nodeBtn(r.start_node_id, r.start_title)}<span class="route-tag">起始节点</span>
+      </div>
+      ${r.steps.map((s, i) => `
+        <div class="route-step">
+          <span class="route-idx">${i + 1}</span>
+          ${nodeBtn(s.node_id, s.title)}
+          <span class="route-choice">—「${esc(s.option_label || "(未命名选项)")}」→</span>
+          ${nodeBtn(s.target_id, s.target_title)}
+          ${s.waypoint ? '<span class="route-tag hit">勾选选项 ✓</span>' : ""}
+        </div>`).join("")}
+      <div class="route-step route-end">
+        <span class="route-idx">终</span>${nodeBtn(r.end_node_id, r.end_title)}
+        <span class="route-tag end">${r.end_terminal ? "终止节点" : "无选项节点"}</span>
+      </div>
+    </div>`;
+  el.querySelectorAll("[data-rnode]").forEach((b) => {
+    b.onclick = () => locateNodeOnCanvas(b.dataset.rnode);
+  });
+}
+
+// Center the node in the viewport and select it (canvas + inspector).
+function locateNodeOnCanvas(id) {
+  const n = getNode(id);
+  if (!n) return;
+  state.selectedNodeId = id;
+  state.selectedEdge = null;
+  const rect = $("#canvasWrap").getBoundingClientRect();
+  state.pan = {
+    x: Math.round(rect.width / 2 - ((n.x || 0) + 115)),
+    y: Math.round(rect.height / 2 - ((n.y || 0) + 60)),
+  };
+  closeModal("routeModal");
+  renderCanvas();
+  renderInspector();
+}
+
 // ---------------------------------------------------------------- rendering
 
 function renderStatus() {
@@ -301,6 +465,7 @@ function renderNodeFlags() {
     el.classList.toggle("flag-cycle", state.markers.cycles.includes(n.id));
     el.classList.toggle("flag-orphan", state.markers.orphans.includes(n.id));
     el.classList.toggle("start", n.id === state.doc.content.start_node_id);
+    el.classList.toggle("selected", n.id === state.selectedNodeId);
     const mark = el.querySelector(".mark");
     mark.innerHTML =
       (state.markers.cycles.includes(n.id) ? `<span class="dot cycle" title="位于环路中"></span>` : "") +
@@ -715,6 +880,8 @@ function bindToolbar() {
   $("#btnSave").onclick = saveScript;
   $("#btnPreview").onclick = openPreview;
   $("#btnCoverage").onclick = openCoverage;
+  $("#btnRoute").onclick = openRoute;
+  $("#routeRun").onclick = runRoutePlan;
   $("#btnShare").onclick = openShare;
   $("#btnExport").onclick = exportJson;
   $("#btnImport").onclick = () => $("#importFile").click();

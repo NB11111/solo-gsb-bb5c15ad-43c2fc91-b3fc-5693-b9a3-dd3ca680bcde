@@ -10,6 +10,7 @@ from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 from .db import get_db, init_db
+from .graph import plan_route
 from .graph import step as graph_step
 from .graph import validate as validate_content
 
@@ -63,6 +64,16 @@ class RunStart(BaseModel):
 
 class RunChoice(BaseModel):
     option_id: str
+
+
+class RouteOptionRef(BaseModel):
+    node_id: str
+    option_id: str
+
+
+class RoutePlanIn(BaseModel):
+    content: ContentIn
+    options: list[RouteOptionRef] = Field(default_factory=list)
 
 
 # ---- lifecycle ------------------------------------------------------------
@@ -232,6 +243,34 @@ def script_coverage(script_id: int):
         "uncovered_options": uncovered_options,
         "coverage_rate": round(covered_total / selectable_total, 4) if selectable_total else 0.0,
     }
+
+
+# ---- route planning -------------------------------------------------------
+
+@app.post("/api/route-plan")
+def plan_route_endpoint(payload: RoutePlanIn):
+    """Shortest route through the checked options — pure read-only computation.
+
+    The posted ``content`` is the caller's current canvas (saved or not).
+    Nothing is written to the database, so planning never saves the script,
+    never creates run records and never affects branch coverage statistics.
+    """
+    refs = list(dict.fromkeys((o.node_id, o.option_id) for o in payload.options))
+    if not 1 <= len(refs) <= 6:
+        raise HTTPException(400, "请勾选 1～6 个已连接目标的选项")
+    content = payload.content.model_dump()
+    node_map = {n["id"]: n for n in content.get("nodes", [])}
+    for node_id, option_id in refs:
+        node = node_map.get(node_id)
+        opt = next((o for o in (node or {}).get("options", [])
+                    if o.get("id") == option_id), None)
+        if opt is None:
+            raise HTTPException(400, "勾选的选项不存在，请刷新画布后重试")
+        target = opt.get("target_id")
+        if not target or target not in node_map:
+            raise HTTPException(400, "勾选的选项未连接目标节点")
+    waypoints = [{"node_id": n, "option_id": o} for n, o in refs]
+    return plan_route(content, waypoints)
 
 
 # ---- import / export ------------------------------------------------------
